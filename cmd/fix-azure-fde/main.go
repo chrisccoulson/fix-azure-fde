@@ -258,6 +258,10 @@ func run() error {
 		return errors.New("key required by nullboot not added to keyring")
 	}
 
+	return nil
+}
+
+func runNullbootctl() error {
 	cmd := exec.Command("nullbootctl")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -270,6 +274,10 @@ func run() error {
 
 func main() {
 	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := runNullbootctl(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
