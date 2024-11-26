@@ -259,6 +259,8 @@ func run() error {
 	}
 
 	cmd := exec.Command("nullbootctl")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("cannot run nullbootctl: %w", err)
 	}
