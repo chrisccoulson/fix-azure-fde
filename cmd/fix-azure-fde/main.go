@@ -31,8 +31,9 @@ import (
 	"strings"
 
 	"github.com/canonical/go-tpm2"
-	"github.com/chrisccoulson/fix-azure-fde/internal/luks2"
+	"github.com/chrisccoulson/fix-azure-fde/luks2"
 	"github.com/snapcore/secboot"
+	secboot_tpm2 "github.com/snapcore/secboot/tpm2"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,7 +42,7 @@ const sealedKeyPath = "/boot/efi/device/fde/cloudimg-rootfs.sealed-key"
 func determineLUKS2ContainerPath() (string, error) {
 	fmt.Println("* Determing LUKS2 container path for rootfs")
 
-	var rootSt *unix.Stat_t
+	var rootSt unix.Stat_t
 	if err := unix.Stat("/", &rootSt); err != nil {
 		return "", fmt.Errorf("cannot stat /: %w", err)
 	}
@@ -75,15 +76,8 @@ func determineLUKS2ContainerPath() (string, error) {
 	}
 	fmt.Printf("  LUKS2 device for rootfs: %d:%d\n", major, minor)
 
-	majorStr, err := strconv.ParseUint(uint64(major), 10)
-	if err != nil {
-		return "", fmt.Errorf("cannot parse major number for LUKS2 device: %w", err)
-	}
-	minorStr, err := strconv.ParseUint(uint64(minor), 10)
-	if err != nil {
-		return "", fmt.Errorf("cannot parse minor number for LUKS2 device: %w", err)
-	}
-
+	majorStr := strconv.FormatUint(uint64(major), 10)
+	minorStr := strconv.FormatUint(uint64(minor), 10)
 	luks2SysfsPath, err := filepath.EvalSymlinks(filepath.Join("/sys/dev/block", fmt.Sprintf("%s:%s", majorStr, minorStr)))
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve path for LUKS2 device: %w", err)
@@ -138,18 +132,18 @@ func askForRecoveryKey(path string) (secboot.RecoveryKey, error) {
 	cmd := exec.Command(
 		"systemd-ask-password",
 		"--icon", "drive-harddisk",
-		"--id", filepath.Base(os.Args[0])+":"+cryptPath,
-		"Please enter recovery code for"+cryptPath)
+		"--id", filepath.Base(os.Args[0])+":"+path,
+		"Please enter recovery code for "+path)
 	out := new(bytes.Buffer)
 	cmd.Stdout = out
 	cmd.Stdin = os.Stdin
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cannot execute systemd-ask-password: %v", err)
+		return secboot.RecoveryKey{}, fmt.Errorf("cannot execute systemd-ask-password: %v", err)
 	}
 	result, err := out.ReadString('\n')
 	if err != nil {
 		// The only error returned from bytes.Buffer.ReadString is io.EOF.
-		return errors.New("systemd-ask-password output is missing terminating newline")
+		return secboot.RecoveryKey{}, errors.New("systemd-ask-password output is missing terminating newline")
 	}
 	password := strings.TrimRight(result, "\n")
 	key, err := secboot.ParseRecoveryKey(password)
@@ -218,19 +212,19 @@ func run() error {
 	}
 
 	fmt.Println("* Connecting to TPM")
-	tpm, err := secboot.ConnectToDefaultTPM()
+	tpm, err := secboot_tpm2.ConnectToDefaultTPM()
 	if err != nil {
 		return fmt.Errorf("cannot connect to TPM: %w", err)
 	}
 	defer tpm.Close()
 
 	fmt.Println("* Sealing new key to TPM")
-	authKey, err := SealKeyToTPM(tpm, key[:], sealedKeyPath, params)
+	authKey, err := secboot_tpm2.SealKeyToTPM(tpm, key[:], sealedKeyPath, &params)
 	if err != nil {
 		return fmt.Errorf("cannot seal new TPM key: %w", err)
 	}
 
-	var st *unix.Stat_t
+	var st unix.Stat_t
 	if err := unix.Stat(luks2Path, &st); err != nil {
 		return fmt.Errorf("cannot stat LUKS2 path: %w", err)
 	}
@@ -245,15 +239,15 @@ func run() error {
 
 	addedKeyToKeyring := false
 	for _, entry := range entries {
-		path := filepath.Join(byPartUUIDDir, entry.Name())
+		path := filepath.Join(byPartUUIDDir.Name(), entry.Name())
 
-		var st2 *unix.Stat_t
-		if err := unix.Stat(path); err != nil {
+		var st2 unix.Stat_t
+		if err := unix.Stat(path, &st2); err != nil {
 			return fmt.Errorf("cannot stat %s: %w", path, err)
 		}
 		if st.Rdev == st2.Rdev {
 			fmt.Println("* Adding key to root user keyring for nullboot")
-			if _, err := unix.AddKey("user", fmt.Sprintf("ubuntu-fde:%s:aux", path), key, -4); err != nil {
+			if _, err := unix.AddKey("user", fmt.Sprintf("ubuntu-fde:%s:aux", path), authKey, -4); err != nil {
 				return fmt.Errorf("cannot add key to root user keyring for nullboot: %w", err)
 			}
 			addedKeyToKeyring = true

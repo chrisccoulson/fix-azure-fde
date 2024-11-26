@@ -37,8 +37,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/snapcore/secboot/internal/paths"
-
 	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 )
@@ -48,7 +46,7 @@ var (
 )
 
 func cryptsetupLockDir() string {
-	return filepath.Join(paths.RunDir, "cryptsetup")
+	return filepath.Join("/run", "cryptsetup")
 }
 
 var isBlockDevice = func(mode os.FileMode) bool {
