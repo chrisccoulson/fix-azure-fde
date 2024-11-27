@@ -20,7 +20,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -28,7 +27,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/canonical/go-tpm2"
 	"github.com/chrisccoulson/fix-azure-fde/luks2"
@@ -128,30 +126,58 @@ func sanitizeLUKS2Container(path string) error {
 	return nil
 }
 
-func askForRecoveryKey(path string) (secboot.RecoveryKey, error) {
-	cmd := exec.Command(
-		"systemd-ask-password",
-		"--icon", "drive-harddisk",
-		"--id", filepath.Base(os.Args[0])+":"+path,
-		"Please enter recovery code for "+path)
-	out := new(bytes.Buffer)
-	cmd.Stdout = out
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return secboot.RecoveryKey{}, fmt.Errorf("cannot execute systemd-ask-password: %v", err)
+func determineKeyringPath(path string) (string, error) {
+	fmt.Println("* Determining keyring path in /dev/disk/by-partuuid")
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return "", fmt.Errorf("cannot stat LUKS2 path: %w", err)
 	}
-	result, err := out.ReadString('\n')
+	dir, err := os.Open("/dev/disk/by-partuuid")
 	if err != nil {
-		// The only error returned from bytes.Buffer.ReadString is io.EOF.
-		return secboot.RecoveryKey{}, errors.New("systemd-ask-password output is missing terminating newline")
+		return "", err
 	}
-	password := strings.TrimRight(result, "\n")
-	key, err := secboot.ParseRecoveryKey(password)
+	defer dir.Close()
+
+	entries, err := dir.ReadDir(0)
 	if err != nil {
-		return secboot.RecoveryKey{}, fmt.Errorf("cannot parse recovery key: %w", err)
+		return "", fmt.Errorf("cannot obtain partitions by UUID: %w", err)
 	}
 
-	return key, nil
+	for _, entry := range entries {
+		path := filepath.Join(dir.Name(), entry.Name())
+
+		var st2 unix.Stat_t
+		if err := unix.Stat(path, &st2); err != nil {
+			return "", fmt.Errorf("cannot stat %s: %w", path, err)
+		}
+		if st.Rdev == st2.Rdev {
+			fmt.Println("  keyring path:", path)
+			return path, nil
+		}
+	}
+	return "", errors.New("failed to find keyring path in /dev/disk/by/partuuid")
+}
+
+func obtainRecoveryKey(path string) (secboot.RecoveryKey, error) {
+	// We need possessor read permissions to read the recovery key from the keyring,
+	// which we don't have unless the user keyring is reachable from the process keyring
+	// set. Link the user keyring from the process keyring to make this work.
+	if _, err := unix.KeyctlInt(unix.KEYCTL_LINK, -4, -2, 0, 0); err != nil {
+		return secboot.RecoveryKey{}, fmt.Errorf("cannot link user keyring into process keyring: %w", err)
+	}
+
+	key, err := secboot.GetDiskUnlockKeyFromKernel("ubuntu-fde", path, false)
+	if err != nil {
+		return secboot.RecoveryKey{}, fmt.Errorf("cannot obtain recovery key from kernel: %w", err)
+	}
+	if len(key) != 16 {
+		return secboot.RecoveryKey{}, fmt.Errorf("recovery key has wrong length (%d bytes)", len(key))
+	}
+
+	var recoveryKey secboot.RecoveryKey
+	copy(recoveryKey[:], key)
+
+	return recoveryKey, nil
 }
 
 func run() error {
@@ -164,7 +190,12 @@ func run() error {
 		return fmt.Errorf("cannot sanitize LUKS2 container: %w", err)
 	}
 
-	recoveryKey, err := askForRecoveryKey(luks2Path)
+	keyringPath, err := determineKeyringPath(luks2Path)
+	if err != nil {
+		return fmt.Errorf("cannot determine keyring path: %w", err)
+	}
+
+	recoveryKey, err := obtainRecoveryKey(keyringPath)
 	if err != nil {
 		return fmt.Errorf("cannot obtain recovery key for LUKS2 container: %w", err)
 	}
@@ -224,38 +255,8 @@ func run() error {
 		return fmt.Errorf("cannot seal new TPM key: %w", err)
 	}
 
-	var st unix.Stat_t
-	if err := unix.Stat(luks2Path, &st); err != nil {
-		return fmt.Errorf("cannot stat LUKS2 path: %w", err)
-	}
-	byPartUUIDDir, err := os.Open("/dev/disk/by-partuuid")
-	if err != nil {
-		return err
-	}
-	entries, err := byPartUUIDDir.ReadDir(0)
-	if err != nil {
-		return fmt.Errorf("cannot obtain partitions by UUID: %w", err)
-	}
-
-	addedKeyToKeyring := false
-	for _, entry := range entries {
-		path := filepath.Join(byPartUUIDDir.Name(), entry.Name())
-
-		var st2 unix.Stat_t
-		if err := unix.Stat(path, &st2); err != nil {
-			return fmt.Errorf("cannot stat %s: %w", path, err)
-		}
-		if st.Rdev == st2.Rdev {
-			fmt.Println("* Adding key to root user keyring for nullboot")
-			if _, err := unix.AddKey("user", fmt.Sprintf("ubuntu-fde:%s:aux", path), authKey, -4); err != nil {
-				return fmt.Errorf("cannot add key to root user keyring for nullboot: %w", err)
-			}
-			addedKeyToKeyring = true
-			break
-		}
-	}
-	if !addedKeyToKeyring {
-		return errors.New("key required by nullboot not added to keyring")
+	if _, err := unix.AddKey("user", fmt.Sprintf("ubuntu-fde:%s:aux", keyringPath), authKey, -4); err != nil {
+		return fmt.Errorf("cannot add key to root user keyring for nullboot: %w", err)
 	}
 
 	return nil
